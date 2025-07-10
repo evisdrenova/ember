@@ -14,6 +14,18 @@ import time
 import threading
 from datetime import datetime
 
+def load_env():
+    env_file = Path('.env')
+    if env_file.exists():
+        with open(env_file) as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    os.environ[key] = value
+
+# Call this at the start of your script
+load_env()
+
 class AlexaAssistant:
     def __init__(self):
         self.is_listening = False
