@@ -198,7 +198,6 @@
 #     assistant.listen_loop()
 
 
-
 #!/usr/bin/env python3
 """
 ========================================================================
@@ -353,16 +352,25 @@ class LocalAssistant:
         print("🎵 Using direct ALSA recording...")
         self.alsa_device = "plughw:3,0"
         
-        # Test ALSA recording works
+        # Test ALSA recording works with a proper duration
         test_cmd = [
             "arecord", "-D", self.alsa_device, "-f", "S16_LE", 
             "-r", str(self.rate), "-c", "1", "-t", "wav", 
-            "-d", "0.1", "/tmp/test_audio.wav"
+            "-d", "1", "/tmp/test_audio.wav"  # 1 second test
         ]
         try:
-            subprocess.run(test_cmd, check=True, capture_output=True)
+            print(f"🧪 Testing ALSA recording: {' '.join(test_cmd)}")
+            result = subprocess.run(test_cmd, check=True, capture_output=True, text=True)
             print("✅ ALSA recording test successful")
-            os.remove("/tmp/test_audio.wav")
+            if os.path.exists("/tmp/test_audio.wav"):
+                os.remove("/tmp/test_audio.wav")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ ALSA test failed with exit code {e.returncode}")
+            if e.stderr:
+                print(f"❌ STDERR: {e.stderr}")
+            if e.stdout:
+                print(f"❌ STDOUT: {e.stdout}")
+            raise
         except Exception as e:
             print(f"❌ ALSA test failed: {e}")
             raise
