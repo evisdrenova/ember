@@ -199,8 +199,6 @@
 
 
 
-
-
 #!/usr/bin/env python3
 """
 ========================================================================
@@ -243,7 +241,7 @@ import requests
 WAKE_WORD       = "ember"                          # Porcupine built-in keyword
 LISTEN_SECONDS  = 4                                # Duration to capture command
 INPUT_DEVICE_INDEX: Optional[int] = 3              # Card 3 for input (microphone)
-OUTPUT_DEVICE   = "plughw:4,0"                     # ALSA device string for aplay
+OUTPUT_DEVICE   = "plughw:4,0"                     # Card 4 for output (speaker)
 VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
 PIPER_MODEL     = "models/en_US-amy-low.onnx"
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")      # optional
@@ -351,37 +349,55 @@ class LocalAssistant:
             print(f"❌ Vosk model loading failed: {e}")
             raise
 
-        # Audio I/O
-        print("🎵 Initializing PyAudio...")
+        # Audio I/O - Use ALSA directly since plughw:3,0 works
+        print("🎵 Using direct ALSA recording...")
+        self.alsa_device = "plughw:3,0"
+        
+        # Test ALSA recording works
+        test_cmd = [
+            "arecord", "-D", self.alsa_device, "-f", "S16_LE", 
+            "-r", str(self.rate), "-c", "1", "-t", "wav", 
+            "-d", "0.1", "/tmp/test_audio.wav"
+        ]
         try:
-            self.pa = pyaudio.PyAudio()
-            print(f"🎙️  Opening audio stream (device: {INPUT_DEVICE_INDEX or 'default'})")
-            self.stream = self.pa.open(
-                rate=self.rate,
-                channels=1,
-                format=pyaudio.paInt16,
-                input=True,
-                frames_per_buffer=self.frame_len,
-                input_device_index=INPUT_DEVICE_INDEX,
-            )
-            print("✅ Audio stream opened successfully")
+            subprocess.run(test_cmd, check=True, capture_output=True)
+            print("✅ ALSA recording test successful")
+            os.remove("/tmp/test_audio.wav")
         except Exception as e:
-            print(f"❌ Audio initialization failed: {e}")
+            print(f"❌ ALSA test failed: {e}")
             raise
             
         print("🎙️  Assistant ready — say 'Computer' to start")
 
     # -------------------------------------------------------------- #
     def listen_loop(self):
-        print("👂 Starting listen loop...")
+        print("👂 Starting listen loop with ALSA...")
+        
+        # Start continuous recording process
+        arecord_cmd = [
+            "arecord", "-D", self.alsa_device, "-f", "S16_LE",
+            "-r", str(self.rate), "-c", "1", "-t", "raw"
+        ]
+        
         try:
+            print(f"🎙️  Starting arecord: {' '.join(arecord_cmd)}")
+            self.arecord_process = subprocess.Popen(
+                arecord_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            
             while True:
-                pcm = self.stream.read(self.frame_len, exception_on_overflow=False)
-                pcm_int16 = struct.unpack_from("h"* self.frame_len, pcm)
+                # Read one frame of audio data
+                audio_data = self.arecord_process.stdout.read(self.frame_len * 2)  # 2 bytes per sample
+                if len(audio_data) < self.frame_len * 2:
+                    print("⚠️  Audio stream ended unexpectedly")
+                    break
+                
+                pcm_int16 = struct.unpack_from("h" * self.frame_len, audio_data)
                 keyword_index = self.porcupine.process(pcm_int16)
                 if keyword_index >= 0:
                     print(f"🔵 Wake-word detected! (index: {keyword_index})")
                     self.handle_command()
+                    
         except KeyboardInterrupt:
             print("\n⚠️  Keyboard interrupt detected")
             self.cleanup()
@@ -392,27 +408,29 @@ class LocalAssistant:
     # -------------------------------------------------------------- #
     def handle_command(self):
         print("🎤 Starting command capture...")
-        # capture spoken command
-        frames: list[bytes] = []
-        chunks = int(self.rate / self.frame_len * LISTEN_SECONDS)
-        print(f"🎤 Listening for command for {LISTEN_SECONDS} seconds ({chunks} chunks)...")
         
-        for i in range(chunks):
-            if i % 10 == 0:  # Progress indicator every 10 chunks
-                print(f"📊 Progress: {i}/{chunks} chunks")
-            data = self.stream.read(self.frame_len, exception_on_overflow=False)
-            frames.append(data)
+        # Stop the continuous recording temporarily
+        if hasattr(self, 'arecord_process'):
+            self.arecord_process.terminate()
+            self.arecord_process.wait()
         
-        print("💾 Saving audio to temporary file...")
-        # write temp WAV
+        # Record command using ALSA directly
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
             wav_path = Path(wf.name)
-            print(f"📁 Temp file: {wav_path}")
-            with wave.open(wf, 'wb') as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(self.pa.get_sample_size(pyaudio.paInt16))
-                wav_file.setframerate(self.rate)
-                wav_file.writeframes(b"".join(frames))
+            
+        print(f"🎤 Recording command for {LISTEN_SECONDS} seconds...")
+        record_cmd = [
+            "arecord", "-D", self.alsa_device, "-f", "S16_LE",
+            "-r", str(self.rate), "-c", "1", "-t", "wav",
+            "-d", str(LISTEN_SECONDS), str(wav_path)
+        ]
+        
+        try:
+            subprocess.run(record_cmd, check=True, capture_output=True)
+            print("✅ Command recording completed")
+        except Exception as e:
+            print(f"❌ Command recording failed: {e}")
+            return
         
         print("🎯 Processing speech with Vosk...")
         # STT
@@ -437,6 +455,8 @@ class LocalAssistant:
         text = result.get("text", "").strip()
         if not text:
             print("😕 No text detected - I didn't catch that.")
+            # Restart continuous recording
+            self.restart_recording()
             return
         print(f"🗣️  You said: '{text}'")
 
@@ -460,16 +480,28 @@ class LocalAssistant:
                 os.remove(tts_path)
         
         print("✅ Command handling completed\n")
+        
+        # Restart continuous recording for wake word detection
+        self.restart_recording()
+    
+    def restart_recording(self):
+        """Restart the continuous audio recording process"""
+        arecord_cmd = [
+            "arecord", "-D", self.alsa_device, "-f", "S16_LE",
+            "-r", str(self.rate), "-c", "1", "-t", "raw"
+        ]
+        self.arecord_process = subprocess.Popen(
+            arecord_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
 
     # -------------------------------------------------------------- #
     def cleanup(self):
         print("\n🛑 Shutting down assistant...")
         try:
-            print("🔇 Stopping audio stream...")
-            self.stream.stop_stream()
-            self.stream.close()
-            print("🎵 Terminating PyAudio...")
-            self.pa.terminate()
+            if hasattr(self, 'arecord_process'):
+                print("🔇 Stopping audio recording process...")
+                self.arecord_process.terminate()
+                self.arecord_process.wait()
             print("🎯 Cleaning up Porcupine...")
             self.porcupine.delete()
             print("✅ Cleanup completed")
