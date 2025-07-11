@@ -242,8 +242,8 @@ import requests
 # ------------------------------------------------------------------ #
 WAKE_WORD       = "ember"                          # Porcupine built-in keyword
 LISTEN_SECONDS  = 4                                # Duration to capture command
-INPUT_DEVICE_INDEX: Optional[int] = None           # None = default
-OUTPUT_DEVICE   = "plughw:1,0"                     # ALSA device string for aplay
+INPUT_DEVICE_INDEX: Optional[int] = 3              # Card 3 for input (microphone)
+OUTPUT_DEVICE   = "plughw:4,0"                     # ALSA device string for aplay
 VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
 PIPER_MODEL     = "models/en_US-amy-low.onnx"
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")      # optional
