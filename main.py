@@ -1,227 +1,188 @@
 #!/usr/bin/env python3
 """
-Orange Pi Alexa Assistant
-A custom voice assistant using wake word detection, speech recognition, and ChatGPT
+========================================================================
+           ORANGE PI – FULLY LOCAL VOICE ASSISTANT (v0.2)
+========================================================================
+Wake-word  : Picovoice Porcupine  ("jarvis")
+STT        : Vosk small English model
+TTS        : Piper (en_US-amy-low) played via ALSA aplay
+Optional   : ChatGPT completion if OPENAI_API_KEY is exported
+------------------------------------------------------------------------
+Install deps (Python 3.11/3.12):
+  sudo apt install python3-dev portaudio19-dev libatlas-base-dev \
+                     libsndfile1 espeak-ng alsa-utils
+  python -m venv .venv && source .venv/bin/activate
+  pip install pvporcupine vosk pyaudio piper-tts numpy requests
+Download runtime models once:
+  # Porcupine keyword
+  wget https://github.com/Picovoice/porcupine/raw/master/resources/keyword_files/linux/jarvis_linux.ppn -P models
+  # Vosk STT model (≈ 50 MB)
+  wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+  unzip vosk-model-small-en-us-0.15.zip -d models
+  # Piper voice (≈ 75 MB)
+  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en_US/en_US-amy-low.onnx -P models
+------------------------------------------------------------------------
 """
 
+from __future__ import annotations
+import os, sys, struct, wave, json, time, tempfile, subprocess, signal
+from pathlib import Path
+from typing import Optional
+
+import pvporcupine
 import pyaudio
-import wave
-import speech_recognition as sr
+from vosk import Model, KaldiRecognizer
 import requests
-import json
-import os
-import time
-import threading
-from datetime import datetime
 
-def load_env():
-    env_file = Path('.env')
-    if env_file.exists():
-        with open(env_file) as f:
-            for line in f:
-                if line.strip() and not line.startswith('#'):
-                    key, value = line.strip().split('=', 1)
-                    os.environ[key] = value
+# ------------------------------------------------------------------ #
+#                CONFIGURATION — tweak to fit your rig               #
+# ------------------------------------------------------------------ #
+WAKE_WORD       = "jarvis"                          # Porcupine built-in keyword
+LISTEN_SECONDS  = 4                                # Duration to capture command
+INPUT_DEVICE_INDEX: Optional[int] = None           # None = default
+OUTPUT_DEVICE   = "plughw:1,0"                     # ALSA device string for aplay
+VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
+PIPER_MODEL     = "models/en_US-amy-low.onnx"
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")      # optional
 
-# Call this at the start of your script
-load_env()
+# ------------------------------------------------------------------ #
+#                              HELPERS                               #
+# ------------------------------------------------------------------ #
+def play_wave(path: Path):
+    """Play WAV file through ALSA using aplay."""
+    subprocess.run(["aplay", "-q", "-D", OUTPUT_DEVICE, str(path)], check=False)
 
-class AlexaAssistant:
-    def __init__(self):
-        self.is_listening = False
-        self.audio_format = pyaudio.paInt16
-        self.channels = 1
-        self.rate = 16000
-        self.chunk = 1024
-        self.record_seconds = 5
-        
-        # Audio devices (adjust these based on your setup)
-        self.input_device_index = None  # Will auto-detect
-        self.output_device_index = 3    # Your USB speaker
-        
-        # API configuration
-        self.openai_api_key = os.getenv('OPENAI_API_KEY')
-        
-        # Initialize audio
-        self.audio = pyaudio.PyAudio()
-        self.recognizer = sr.Recognizer()
-        
-        print("🤖 Orange Pi Assistant initialized!")
-        self.list_audio_devices()
-    
-    def list_audio_devices(self):
-        """List all available audio devices"""
-        print("\n📱 Available audio devices:")
-        for i in range(self.audio.get_device_count()):
-            device_info = self.audio.get_device_info_by_index(i)
-            print(f"  Device {i}: {device_info['name']} - {device_info['maxInputChannels']} in, {device_info['maxOutputChannels']} out")
-    
-    def detect_wake_word(self, audio_data):
-        """Simple wake word detection - replace with better solution later"""
-        # For now, we'll use speech recognition to detect "Hey Orange"
-        try:
-            text = self.recognizer.recognize_google(audio_data).lower()
-            wake_words = ["hey orange", "orange pi", "hey assistant"]
-            return any(wake_word in text for wake_word in wake_words)
-        except:
-            return False
-    
-    def record_audio(self, duration=5):
-        """Record audio from microphone"""
-        print(f"🎤 Recording for {duration} seconds...")
-        
-        frames = []
-        stream = self.audio.open(
-            format=self.audio_format,
-            channels=self.channels,
-            rate=self.rate,
-            input=True,
-            input_device_index=self.input_device_index,
-            frames_per_buffer=self.chunk
+def piper_tts(text: str, wav_out: Path):
+    """Generate speech with Piper CLI (needs piper in PATH)"""
+    # pipe text via stdin for speed
+    proc = subprocess.run(
+        ["piper", "--model", PIPER_MODEL, "--output_file", str(wav_out)],
+        input=text.encode(),
+        check=True,
+    )
+
+def chatgpt_response(prompt: str) -> str:
+    if not OPENAI_API_KEY:
+        return f"You said: {prompt}"
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [
+            {"role": "system", "content": "You are a concise, helpful assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 120,
+    }
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=10,
         )
-        
-        for i in range(0, int(self.rate / self.chunk * duration)):
-            data = stream.read(self.chunk)
-            frames.append(data)
-        
-        stream.stop_stream()
-        stream.close()
-        
-        # Save to temporary file
-        filename = f"temp_recording_{int(time.time())}.wav"
-        wf = wave.open(filename, 'wb')
-        wf.setnchannels(self.channels)
-        wf.setsampwidth(self.audio.get_sample_size(self.audio_format))
-        wf.setframerate(self.rate)
-        wf.writeframes(b''.join(frames))
-        wf.close()
-        
-        return filename
-    
-    def speech_to_text(self, audio_file):
-        """Convert speech to text using Google Speech Recognition"""
-        try:
-            with sr.AudioFile(audio_file) as source:
-                audio_data = self.recognizer.record(source)
-                text = self.recognizer.recognize_google(audio_data)
-                print(f"💬 You said: {text}")
-                return text
-        except sr.UnknownValueError:
-            print("❌ Could not understand audio")
-            return None
-        except sr.RequestError as e:
-            print(f"❌ Error with speech recognition: {e}")
-            return None
-    
-    def query_chatgpt(self, text):
-        """Send query to ChatGPT API"""
-        if not self.openai_api_key:
-            return "Please set your OpenAI API key in the environment variables."
-        
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.openai_api_key}',
-                'Content-Type': 'application/json'
-            }
-            
-            data = {
-                'model': 'gpt-3.5-turbo',
-                'messages': [
-                    {'role': 'system', 'content': 'You are a helpful voice assistant. Keep responses concise and conversational.'},
-                    {'role': 'user', 'content': text}
-                ],
-                'max_tokens': 150
-            }
-            
-            response = requests.post(
-                'https://api.openai.com/v1/chat/completions',
-                headers=headers,
-                json=data,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                return result['choices'][0]['message']['content'].strip()
-            else:
-                return f"Error: {response.status_code}"
-                
-        except Exception as e:
-            print(f"❌ Error querying ChatGPT: {e}")
-            return "Sorry, I couldn't process your request right now."
-    
-    def text_to_speech(self, text):
-        """Convert text to speech and play it"""
-        print(f"🔊 Speaking: {text}")
-        
-        # For now, we'll use espeak (simple TTS)
-        # Later we can upgrade to better TTS services
-        os.system(f'echo "{text}" | espeak')
-    
-    def play_audio_file(self, filename):
-        """Play audio file through USB speaker"""
-        os.system(f'aplay -D plughw:{self.output_device_index},0 {filename}')
-    
-    def listen_for_wake_word(self):
-        """Continuously listen for wake word"""
-        print("👂 Listening for wake word...")
-        
-        while True:
-            try:
-                # Record short audio snippet
-                audio_file = self.record_audio(duration=2)
-                
-                # Check for wake word
-                with sr.AudioFile(audio_file) as source:
-                    audio_data = self.recognizer.record(source)
-                    
-                if self.detect_wake_word(audio_data):
-                    print("🎯 Wake word detected!")
-                    self.handle_command()
-                
-                # Clean up temporary file
-                os.remove(audio_file)
-                
-            except KeyboardInterrupt:
-                print("\n👋 Goodbye!")
-                break
-            except Exception as e:
-                print(f"❌ Error in wake word detection: {e}")
-                time.sleep(1)
-    
-    def handle_command(self):
-        """Handle voice command after wake word"""
-        # Play acknowledgment sound
-        print("🎵 Beep! Ready for command...")
-        
-        # Record user command
-        audio_file = self.record_audio(duration=5)
-        
-        # Convert to text
-        text = self.speech_to_text(audio_file)
-        
-        if text:
-            # Get response from ChatGPT
-            response = self.query_chatgpt(text)
-            
-            # Convert response to speech
-            self.text_to_speech(response)
-        
-        # Clean up
-        os.remove(audio_file)
-    
-    def run(self):
-        """Main loop"""
-        print("🚀 Starting Orange Pi Assistant...")
-        print("Say 'Hey Orange' to activate!")
-        
-        try:
-            self.listen_for_wake_word()
-        except KeyboardInterrupt:
-            print("\n🛑 Shutting down...")
-        finally:
-            self.audio.terminate()
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[ChatGPT error] {e}")
+        return "Sorry, I had trouble thinking just now."
 
+# ------------------------------------------------------------------ #
+#                           MAIN ASSISTANT                           #
+# ------------------------------------------------------------------ #
+class LocalAssistant:
+    def __init__(self):
+        # Wake-word engine
+        self.porcupine = pvporcupine.create(keyword_paths=[f"models/{WAKE_WORD}_linux.ppn"])
+        self.rate      = self.porcupine.sample_rate
+        self.frame_len = self.porcupine.frame_length
+
+        # STT
+        self.vosk_model = Model(VOSK_MODEL_DIR)
+        self.vosk_rec   = KaldiRecognizer(self.vosk_model, self.rate)
+
+        # Audio I/O
+        self.pa = pyaudio.PyAudio()
+        self.stream = self.pa.open(
+            rate=self.rate,
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=self.frame_len,
+            input_device_index=INPUT_DEVICE_INDEX,
+        )
+        print("🎙️  Assistant ready — say 'Jarvis' to start")
+
+    # -------------------------------------------------------------- #
+    def listen_loop(self):
+        try:
+            while True:
+                pcm = self.stream.read(self.frame_len, exception_on_overflow=False)
+                pcm_int16 = struct.unpack_from("h"* self.frame_len, pcm)
+                if self.porcupine.process(pcm_int16) >= 0:
+                    print("🔵 Wake-word detected!")
+                    self.handle_command()
+        except KeyboardInterrupt:
+            self.cleanup()
+
+    # -------------------------------------------------------------- #
+    def handle_command(self):
+        # capture spoken command
+        frames: list[bytes] = []
+        chunks = int(self.rate / self.frame_len * LISTEN_SECONDS)
+        print("🎤 Listening for command…")
+        for _ in range(chunks):
+            data = self.stream.read(self.frame_len, exception_on_overflow=False)
+            frames.append(data)
+        # write temp WAV
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
+            wav_path = Path(wf.name)
+            with wave.open(wf, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(self.pa.get_sample_size(pyaudio.paInt16))
+                wav_file.setframerate(self.rate)
+                wav_file.writeframes(b"".join(frames))
+        # STT
+        with wave.open(str(wav_path), "rb") as wf:
+            self.vosk_rec.Reset()
+            while True:
+                buf = wf.readframes(self.frame_len)
+                if not buf:
+                    break
+                self.vosk_rec.AcceptWaveform(buf)
+            result = json.loads(self.vosk_rec.FinalResult())
+        os.remove(wav_path)
+        text = result.get("text", "").strip()
+        if not text:
+            print("😕 I didn't catch that.")
+            return
+        print(f"🗣️  You: {text}")
+
+        # ChatGPT / local reply
+        reply = chatgpt_response(text)
+        print(f"🤖 Assistant: {reply}")
+
+        # TTS
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tts_path = Path(f.name)
+        piper_tts(reply, tts_path)
+        play_wave(tts_path)
+        os.remove(tts_path)
+
+    # -------------------------------------------------------------- #
+    def cleanup(self):
+        print("\n🛑 Shutting down…")
+        self.stream.stop_stream()
+        self.stream.close()
+        self.pa.terminate()
+        self.porcupine.delete()
+        sys.exit(0)
+
+
+# ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    assistant = AlexaAssistant()
-    assistant.run()
+    # Graceful ^C
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    assistant = LocalAssistant()
+    assistant.listen_loop()
