@@ -45,6 +45,7 @@ VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
 PIPER_MODEL     = "models/en_US-amy-low.onnx"
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")      # optional
 
+
 # ------------------------------------------------------------------ #
 #                              HELPERS                               #
 # ------------------------------------------------------------------ #
@@ -94,7 +95,15 @@ def chatgpt_response(prompt: str) -> str:
 class LocalAssistant:
     def __init__(self):
         # Wake-word engine
-        self.porcupine = pvporcupine.create(keyword_paths=[f"models/{WAKE_WORD}_linux.ppn"])
+        ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
+        if not ACCESS_KEY:
+            raise RuntimeError("Set PICOVOICE_ACCESS_KEY env var first")
+
+        self.porcupine = pvporcupine.create(
+            access_key=ACCESS_KEY,
+            keyword_paths=[f"models/{WAKE_WORD}_linux.ppn"],
+        )
+    
         self.rate      = self.porcupine.sample_rate
         self.frame_len = self.porcupine.frame_length
 
