@@ -101,7 +101,7 @@ class LocalAssistant:
 
         self.porcupine = pvporcupine.create(
             access_key=ACCESS_KEY,
-            keyword_paths=[f"models/{WAKE_WORD}_linux.ppn"],
+            keyword=["ember"],
         )
     
         self.rate      = self.porcupine.sample_rate
