@@ -101,7 +101,7 @@ class LocalAssistant:
 
         self.porcupine = pvporcupine.create(
             access_key=ACCESS_KEY,
-            keywords=["ember"],
+            keywords=["computer"],
         )
     
         self.rate      = self.porcupine.sample_rate
