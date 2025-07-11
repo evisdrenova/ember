@@ -37,7 +37,7 @@ import requests
 # ------------------------------------------------------------------ #
 #                CONFIGURATION — tweak to fit your rig               #
 # ------------------------------------------------------------------ #
-WAKE_WORD       = "jarvis"                          # Porcupine built-in keyword
+WAKE_WORD       = "ember"                          # Porcupine built-in keyword
 LISTEN_SECONDS  = 4                                # Duration to capture command
 INPUT_DEVICE_INDEX: Optional[int] = None           # None = default
 OUTPUT_DEVICE   = "plughw:1,0"                     # ALSA device string for aplay
