@@ -413,7 +413,7 @@ PIPER_MODEL     = "models/en_US-amy-low.onnx"
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")      # optional
 
 # gRPC server configuration
-GRPC_SERVER_HOST = "192.168.1.100"                 # Your Mac's IP address
+GRPC_SERVER_HOST = "192.168.1.20"                 # Your Mac's IP address
 GRPC_SERVER_PORT = 8080
 
 
