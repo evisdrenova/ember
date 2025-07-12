@@ -11,5 +11,5 @@ dependencies = [
     "openai",
     "pyttsx3",
     "pvporcupine",
-    "numpy >1.24.3",
+    "numpy >1.24.3","grpcio","grpcio-tools","protobuf"
 ]

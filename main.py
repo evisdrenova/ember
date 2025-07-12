@@ -34,7 +34,7 @@ import pyaudio
 from vosk import Model, KaldiRecognizer
 import requests
 
-WAKE_WORD       = "ember"                          # Porcupine built-in keyword
+WAKE_WORD       = "computer"                          # Porcupine built-in keyword
 LISTEN_SECONDS  = 4                                # Duration to capture command
 INPUT_DEVICE_INDEX: Optional[int] = 3              # Card 3 for input (microphone)
 OUTPUT_DEVICE   = "plughw:4,0"                     # Card 4 for output (speaker)
