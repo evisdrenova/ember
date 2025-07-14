@@ -56,3 +56,30 @@ connect to a network - `sudo nmcli dev wifi connect "wifiname" password "your_wi
 to list audio device - `aplay -l`
 look for `UACDemoV10 [UACDemoV1.0], device 0: USB Audio [USB Audio]`
 =
+
+
+
+"""
+========================================================================
+           ORANGE PI – FULLY LOCAL VOICE ASSISTANT (v0.2)
+========================================================================
+Wake-word  : Picovoice Porcupine  ("jarvis")
+STT        : Vosk small English model
+TTS        : Piper (en_US-amy-low) played via ALSA aplay
+Optional   : ChatGPT completion if OPENAI_API_KEY is exported
+------------------------------------------------------------------------
+Install deps (Python 3.11/3.12):
+  sudo apt install python3-dev portaudio19-dev libatlas-base-dev \
+                     libsndfile1 espeak-ng alsa-utils
+  python -m venv .venv && source .venv/bin/activate
+  pip install pvporcupine vosk pyaudio piper-tts numpy requests
+Download runtime models once:
+  # Porcupine keyword
+  wget https://github.com/Picovoice/porcupine/raw/master/resources/keyword_files/linux/jarvis_linux.ppn -P models
+  # Vosk STT model (≈ 50 MB)
+  wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+  unzip vosk-model-small-en-us-0.15.zip -d models
+  # Piper voice (≈ 75 MB)
+  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en_US/en_US-amy-low.onnx -P models
+------------------------------------------------------------------------
+"""

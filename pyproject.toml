@@ -11,5 +11,10 @@ dependencies = [
     "openai",
     "pyttsx3",
     "pvporcupine",
-    "numpy >1.24.3","grpcio","grpcio-tools","protobuf"
+    "numpy >1.24.3",
+    "grpcio",
+    "grpcio-tools",
+    "protobuf",
+    "vosk>=0.3.45",
+    "python-dotenv>=1.0.1",
 ]
