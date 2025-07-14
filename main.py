@@ -119,6 +119,10 @@ def grpc_chat_response(text: str) -> str:
             print(f"📥 Received response: {response.text_response}")
             channel.close()
             return response.text_response
+        
+        # If no responses received
+        channel.close()
+        return "No response received from server"
             
     except Exception as e:
         print(f"❌ gRPC error: {e}")
