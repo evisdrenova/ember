@@ -20,16 +20,16 @@ LISTEN_SECONDS  = 4                                # Duration to capture command
 INPUT_DEVICE_INDEX: Optional[int] = 3              # Card 3 for input (microphone)
 OUTPUT_DEVICE   = "plughw:4,0"                     # Card 4 for output (speaker)
 VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
-PIPER_MODEL     = "models/en_US-amy-low.onnx"
+PIPER_MODEL = "models/en_US-amy-medium.onnx"
+PIPER_BINARY = "./piper/piper"
 
 GRPC_SERVER_HOST = "192.168.1.20"               
 GRPC_SERVER_PORT = 8080
 
-
-
 def play_wave(path: Path):
     """Play WAV file through ALSA using aplay."""
     print(f"🔊 Playing audio file: {path}")
+    
     try:
         subprocess.run(["aplay", "-q", "-D", OUTPUT_DEVICE, str(path)], check=False)
         print("✅ Audio playback completed")
@@ -37,26 +37,34 @@ def play_wave(path: Path):
         print(f"❌ Audio playback failed: {e}")
 
 def piper_tts(text: str, wav_out: Path):
-    """Generate speech with Piper (try command line first, fallback to espeak)"""
+    """Generate speech with Piper (local binary)"""
     print(f"🗣️  Generating TTS for: '{text}'")
     print(f"📁 Output file: {wav_out}")
     
-    # Try command line piper first
+    # Try local piper binary first
     try:
+        # Set up environment with library path for piper dependencies
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = f"./piper:{env.get('LD_LIBRARY_PATH', '')}"
+        
         proc = subprocess.run(
-            ["piper", "--model", PIPER_MODEL, "--output_file", str(wav_out)],
+            ["./piper/piper", "--model", PIPER_MODEL, "--output_file", str(wav_out)],
             input=text.encode(),
             check=True,
-            capture_output=True
+            capture_output=True,
+            env=env,
+            cwd=os.getcwd()  # Ensure we're in the right directory
         )
         print("✅ TTS generation completed (Piper)")
         return
-    except FileNotFoundError:
-        print("⚠️  Piper not found, using espeak-ng...")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Piper failed with exit code {e.returncode}")
+        if e.stderr:
+            print(f"⚠️  Piper stderr: {e.stderr.decode()}")
     except Exception as e:
-        print(f"⚠️  Piper failed: {e}, using espeak-ng...")
+        print(f"⚠️  Piper failed: {e}")
     
-    # Fallback to espeak-ng - generate WAV file instead of direct audio
+    # Fallback to espeak-ng
     try:
         subprocess.run(
             ["espeak-ng", "-s", "150", "-v", "en", "-w", str(wav_out), text],
@@ -66,25 +74,11 @@ def piper_tts(text: str, wav_out: Path):
         print("✅ TTS generation completed (espeak-ng)")
     except Exception as e:
         print(f"❌ espeak-ng failed: {e}")
-        # Try festival as last resort
-        try:
-            # Create a simple text file and use festival
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                f.write(text)
-                temp_txt = f.name
-            
-            subprocess.run([
-                "text2wave", temp_txt, "-o", str(wav_out)
-            ], check=True, capture_output=True)
-            os.remove(temp_txt)
-            print("✅ TTS generation completed (festival)")
-        except Exception as e2:
-            print(f"❌ All TTS methods failed: {e2}")
-            # Create a beep sound as absolute last resort
-            subprocess.run([
-                "sox", "-n", str(wav_out), "synth", "0.5", "sine", "800"
-            ], check=False, capture_output=True)
-            print("⚠️  Created beep sound as fallback")
+        # Create a beep sound as absolute last resort
+        subprocess.run([
+            "sox", "-n", str(wav_out), "synth", "0.5", "sine", "800"
+        ], check=False, capture_output=True)
+        print("⚠️  Created beep sound as fallback")
 
 def grpc_chat_response(text: str) -> str:
     """Send text to Go gRPC server and get response"""
