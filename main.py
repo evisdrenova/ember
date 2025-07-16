@@ -29,56 +29,58 @@ GRPC_SERVER_PORT = 8080
 def play_wave(path: Path):
     """Play WAV file through ALSA using aplay."""
     print(f"🔊 Playing audio file: {path}")
-    
+
     try:
         subprocess.run(["aplay", "-q", "-D", OUTPUT_DEVICE, str(path)], check=False)
         print("✅ Audio playback completed")
     except Exception as e:
         print(f"❌ Audio playback failed: {e}")
 
-def piper_tts(text: str, wav_out: Path):
-    """Generate speech with Piper (local binary)"""
-    print(f"🗣️  Generating TTS for: '{text}'")
-    print(f"📁 Output file: {wav_out}")
+def piper_tts(text: str):
+    """Generate and play speech with Piper streaming (no file creation)"""
+    print(f"🗣️  Streaming TTS for: '{text}'")
     
-    # Try local piper binary first
     try:
-        # Set up environment with library path for piper dependencies
+        # Set up environment with library path
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = f"./piper:{env.get('LD_LIBRARY_PATH', '')}"
         
-        proc = subprocess.run(
-            ["./piper/piper", "--model", PIPER_MODEL, "--output_file", str(wav_out)],
-            input=text.encode(),
-            check=True,
-            capture_output=True,
-            env=env,
-            cwd=os.getcwd()  # Ensure we're in the right directory
+        # Stream to aplay directly (no intermediate file)
+        piper_process = subprocess.Popen(
+            ["./piper/piper", "--model", PIPER_MODEL, "--output-raw"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env
         )
-        print("✅ TTS generation completed (Piper)")
-        return
-    except subprocess.CalledProcessError as e:
-        print(f"⚠️  Piper failed with exit code {e.returncode}")
-        if e.stderr:
-            print(f"⚠️  Piper stderr: {e.stderr.decode()}")
-    except Exception as e:
-        print(f"⚠️  Piper failed: {e}")
-    
-    # Fallback to espeak-ng
-    try:
-        subprocess.run(
-            ["espeak-ng", "-s", "150", "-v", "en", "-w", str(wav_out), text],
-            check=True,
-            capture_output=True
+        
+        # Stream to audio player
+        aplay_process = subprocess.Popen(
+            ["aplay", "-D", OUTPUT_DEVICE, "-r", "22050", "-f", "S16_LE", "-t", "raw"],
+            stdin=piper_process.stdout,
+            stderr=subprocess.PIPE
         )
-        print("✅ TTS generation completed (espeak-ng)")
+
+        if  piper_process.stdin and piper_process.stdout:
+            # Send text to piper
+            piper_process.stdin.write(text.encode())
+            piper_process.stdin.close()
+            
+            # Wait for both processes to complete
+            piper_process.stdout.close()
+            aplay_return = aplay_process.wait()
+            piper_return = piper_process.wait()
+        
+        if piper_return == 0 and aplay_return == 0:
+            print("✅ TTS streaming completed (Piper)")
+            return True
+        else:
+            print(f"⚠️  Streaming failed: piper={piper_return}, aplay={aplay_return}")
+            return False
+            
     except Exception as e:
-        print(f"❌ espeak-ng failed: {e}")
-        # Create a beep sound as absolute last resort
-        subprocess.run([
-            "sox", "-n", str(wav_out), "synth", "0.5", "sine", "800"
-        ], check=False, capture_output=True)
-        print("⚠️  Created beep sound as fallback")
+        print(f"⚠️  Piper streaming failed: {e}")
+        return False
 
 def grpc_chat_response(text: str) -> str:
     """Send text to Go gRPC server and get response"""
@@ -285,7 +287,7 @@ class Ember:
             tts_path = Path(f.name)
         
         try:
-            piper_tts(reply, tts_path)
+            piper_tts(reply)
             play_wave(tts_path)
         except Exception as e:
             print(f"❌ TTS/Audio error: {e}")
