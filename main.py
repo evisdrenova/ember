@@ -163,10 +163,7 @@ class Ember:
             return
         print(f"🗣️  You said: '{text}'")
 
-        fakeText = "what kind of cat should i adopt?"
-
-        # Send to gRPC server replace with text when ready for real run
-        reply = grpc_chat_response(fakeText)
+        reply = grpc_chat_response(text)
         print(f"🤖 Assistant response: '{reply}'")
 
         # TTS
