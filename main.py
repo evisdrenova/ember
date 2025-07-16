@@ -3,138 +3,28 @@ from __future__ import annotations
 import os, sys, struct, wave, json, time, tempfile, subprocess, signal
 from pathlib import Path
 from typing import Optional
-
+from audio import play_wave, piper_tts
+from chat import grpc_chat_response
 import pvporcupine
-import pyaudio
 from vosk import Model, KaldiRecognizer
-import grpc
-from pkg.proto import assistant_pb2
-from pkg.proto import assistant_pb2_grpc
-import uuid
 from dotenv import load_dotenv
 
 load_dotenv()
 
-WAKE_WORD       = "computer"                       # Porcupine built-in keyword
+
 LISTEN_SECONDS  = 4                                # Duration to capture command
 INPUT_DEVICE_INDEX: Optional[int] = 3              # Card 3 for input (microphone)
-OUTPUT_DEVICE   = "plughw:4,0"                     # Card 4 for output (speaker)
 VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
-PIPER_MODEL = "models/en_US-amy-medium.onnx"
-PIPER_BINARY = "./piper/piper"
 
-GRPC_SERVER_HOST = "192.168.1.20"               
-GRPC_SERVER_PORT = 8080
-
-def play_wave(path: Path):
-    """Play WAV file through ALSA using aplay."""
-    print(f"🔊 Playing audio file: {path}")
-
-    try:
-        subprocess.run(["aplay", "-q", "-D", OUTPUT_DEVICE, str(path)], check=False)
-        print("✅ Audio playback completed")
-    except Exception as e:
-        print(f"❌ Audio playback failed: {e}")
-
-def piper_tts(text: str):
-    """Generate and play speech with Piper streaming (no file creation)"""
-    print(f"🗣️  Streaming TTS for: '{text}'")
-    
-    try:
-        # Set up environment with library path
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = f"./piper:{env.get('LD_LIBRARY_PATH', '')}"
-        
-        # Stream to aplay directly (no intermediate file)
-        piper_process = subprocess.Popen(
-            ["./piper/piper", "--model", PIPER_MODEL, "--output-raw"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env
-        )
-        
-        # Stream to audio player
-        aplay_process = subprocess.Popen(
-            ["aplay", "-D", OUTPUT_DEVICE, "-r", "22050", "-f", "S16_LE", "-t", "raw"],
-            stdin=piper_process.stdout,
-            stderr=subprocess.PIPE
-        )
-
-        if  piper_process.stdin and piper_process.stdout:
-            # Send text to piper
-            piper_process.stdin.write(text.encode())
-            piper_process.stdin.close()
-            
-            # Wait for both processes to complete
-            piper_process.stdout.close()
-            aplay_return = aplay_process.wait()
-            piper_return = piper_process.wait()
-        
-        if piper_return == 0 and aplay_return == 0:
-            print("✅ TTS streaming completed (Piper)")
-            return True
-        else:
-            print(f"⚠️  Streaming failed: piper={piper_return}, aplay={aplay_return}")
-            return False
-            
-    except Exception as e:
-        print(f"⚠️  Piper streaming failed: {e}")
-        return False
-
-def grpc_chat_response(text: str) -> str:
-    """Send text to Go gRPC server and get response"""
-    print(f"🔗 Connecting to gRPC server at {GRPC_SERVER_HOST}:{GRPC_SERVER_PORT}")
-    
-    try:
-        # Create gRPC channel
-        channel = grpc.insecure_channel(f'{GRPC_SERVER_HOST}:{GRPC_SERVER_PORT}')
-        stub = assistant_pb2_grpc.AssistantServiceStub(channel)
-        
-        # Generate session ID
-        session_id = str(uuid.uuid4())
-        
-        # Create request
-        request = assistant_pb2.ChatRequest(
-            session_id=session_id,
-            message=text,
-            audio_data=b'' 
-        )
-        
-        print(f"📤 Sending request: session={session_id}, message='{text}'")
-        
-        # Create request stream
-        def request_generator():
-            yield request
-        
-        # Call the streaming RPC
-        responses = stub.Chat(request_generator())
-        
-        # Get the first response
-        for response in responses:
-            print(f"📥 Received response: {response.text_response}")
-            channel.close()
-            return response.text_response
-        
-        # If no responses received
-        channel.close()
-        return "No response received from server"
-            
-    except Exception as e:
-        print(f"❌ gRPC error: {e}")
-        return f"Sorry, I couldn't connect to the server: {e}"
-    
 class Ember:
     def __init__(self):
         print("Initializing Ember...")
         print("-" * 70)
-
-        '''available keywords are = ok google, bumblebee, grasshopper, hey siri, porcupine, terminator, alexa, hey barista, jarvis, computer, americano, pico clock, hey google, grapefruit, blueberry, picovoice'''
         try:
             PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
             self.porcupine = pvporcupine.create(
                 access_key=PICOVOICE_ACCESS_KEY,
-                keywords=[WAKE_WORD],
+                keywords=["computer"],
             )
             print("✅ Porcupine initialized successfully")
         except Exception as e:
@@ -184,7 +74,6 @@ class Ember:
             
         print("🎙️  Assistant ready — say 'Computer' to start")
 
-    # -------------------------------------------------------------- #
     def listen_loop(self):
         print("👂 Starting listen loop with ALSA...")
         
@@ -200,7 +89,7 @@ class Ember:
                 arecord_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             
-            while True:
+            while True and self.arecord_process.stdout:
                 # Read one frame of audio data
                 audio_data = self.arecord_process.stdout.read(self.frame_len * 2)  # 2 bytes per sample
                 if len(audio_data) < self.frame_len * 2:
@@ -220,7 +109,6 @@ class Ember:
             print(f"❌ Listen loop error: {e}")
             self.cleanup()
 
-    # -------------------------------------------------------------- #
     def handle_command(self):
         print("🎤 Starting command capture...")
         
