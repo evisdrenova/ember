@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package assistant.v1;
 
-option go_package = "github.com/evisdrenova/ember-server/pkg/proto";
-
 message ChatRequest {
   string session_id = 1;
   string message = 2;
@@ -18,5 +16,5 @@ message ChatResponse {
 }
 
 service AssistantService {
-  rpc Chat(stream ChatRequest) returns (stream ChatResponse);
+  rpc Chat(ChatRequest) returns (stream ChatResponse);
 }
