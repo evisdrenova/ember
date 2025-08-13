@@ -19,6 +19,7 @@ _GRPC_OPTIONS = [
 ]
 
 def _verbose(): return _VERBOSE
+
 def _log(msg: str):
     if _verbose():
         print(msg)

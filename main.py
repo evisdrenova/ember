@@ -10,11 +10,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LISTEN_SECONDS  = 6                                # Duration to capture command
-INPUT_DEVICE_INDEX: Optional[int] = 3              # Card 3 for input (microphone)
+LISTEN_SECONDS  = 6           
 VOSK_MODEL_DIR  = "models/vosk-model-small-en-us-0.15"
-OUTPUT_DEVICE   = os.getenv("OUTPUT_DEVICE", "plughw:4,0")
-
 
 class Ember:
     def __init__(self):
@@ -55,6 +52,7 @@ class Ember:
             "-r", str(self.rate), "-c", "1", "-t", "wav",
             "-d", "1", "/tmp/test_audio.wav"  # 1 second test
         ]
+        
         try:
             print(f"🧪 Testing ALSA recording: {' '.join(test_cmd)}")
             subprocess.run(test_cmd, check=True, capture_output=True, text=True)
@@ -156,23 +154,18 @@ class Ember:
             print(f"❌ Speech processing failed: {e}")
             os.remove(wav_path)
             return
-
-        print(f"🗑️  Cleaning up temp file: {wav_path}")
+        
         os.remove(wav_path)
 
         text = result.get("text", "").strip()
         if not text:
             print("😕 No text detected - I didn't catch that.")
-            # Restart continuous recording
             self.restart_recording()
             return
         print(f"🗣️  You said: '{text}'")
 
-        # reply = grpc_chat_response(text)  # may be a string or a streaming generator
-        # ---- Ask the server, collect full text, then speak once ----
-        print("🧠 Contacting assistant...")
         try:
-            full = grpc_chat_response(text)  # returns a single string
+            full = grpc_chat_response(text) 
         except Exception as e:
             print(f"❌ gRPC error collecting response: {e}")
             self.restart_recording()
@@ -222,7 +215,6 @@ class Ember:
 
 
 if __name__ == "__main__":
-    # Graceful ^C
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
 
     try:
