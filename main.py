@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, sys, struct, wave, json, time, tempfile, subprocess, signal
 from pathlib import Path
 from typing import Optional
-from audio import preload_tts, tts_stream
+from audio import preload_tts, tts_stream,tts_say_full,simple_tts_say
 from chat import grpc_chat_response
 import pvporcupine
 from vosk import Model, KaldiRecognizer
@@ -47,7 +47,7 @@ class Ember:
 
         # Audio I/O - Use ALSA directly since plughw:3,0 works
         print("🎵 Using direct ALSA recording...")
-        self.alsa_device = "plughw:3,0"
+        self.alsa_device = "plughw:4,0"
 
         # Test ALSA recording works with a proper duration
         test_cmd = [
@@ -74,7 +74,7 @@ class Ember:
 
         # Preload Kitten TTS once at startup
         print("🐱 Preloading KittenTTS...")
-        preload_tts()  # uses env KITTEN_MODEL / KITTEN_VOICE if set
+        preload_tts() 
         print("✅ KittenTTS ready")
 
         print("🎙️  Assistant ready — say 'Computer' to start")
@@ -168,19 +168,32 @@ class Ember:
             return
         print(f"🗣️  You said: '{text}'")
 
-        reply = grpc_chat_response(text)  # may be a string or a streaming generator
-
-        # TTS (stream as chunks arrive)
-        print("🎵 Generating and playing response (KittenTTS streaming)...")
+        # reply = grpc_chat_response(text)  # may be a string or a streaming generator
+        # ---- Ask the server, collect full text, then speak once ----
+        print("🧠 Contacting assistant...")
         try:
-            tts_stream(reply)
+            full = grpc_chat_response(text)  # returns a single string
+        except Exception as e:
+            print(f"❌ gRPC error collecting response: {e}")
+            self.restart_recording()
+            return
+
+        print("the full response", full)
+        if not full or not full.strip():
+            print("⚠️ Empty response from server.")
+            self.restart_recording()
+            return
+
+        print(f"✅ Complete response received ({len(full)} chars)")
+        print("🗣️ Speaking full response...")
+        try:
+            ok = tts_say_full(full)  
+            if not ok:
+                print("❌ TTS playback failed")
         except Exception as e:
             print(f"❌ TTS/Audio error: {e}")
         finally:
             print("✅ Command handling completed\n")
-
-        # Restart continuous recording for wake word detection
-        self.restart_recording()
 
     def restart_recording(self):
         """Restart the continuous audio recording process"""

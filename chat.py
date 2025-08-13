@@ -37,57 +37,19 @@ def _open_channel():
     _log("✅ Channel ready")
     return channel
 
-def grpc_chat_response(text: str):
-    """Unary request -> server-streaming responses. Yields text chunks."""
-    channel = None
+def grpc_chat_response(text: str, timeout: int = 120) -> str:
+    
     try:
         channel = _open_channel()
         stub = assistant_pb2_grpc.AssistantServiceStub(channel)
-
         session_id = str(uuid.uuid4())
-        request = assistant_pb2.ChatRequest(
-            session_id=session_id,
-            message=text,
-            audio_data=b"",
-        )
-        print(f"📤 Sending request: session={session_id}, message='{text}'")
-
-        got_any_msg = False
-        got_any_text = False
-
-        responses = stub.Chat(request, timeout=120)
-        for i, response in enumerate(responses, start=1):
-            got_any_msg = True
-            try:
-                fields = response.ListFields()
-                _log(f"📦 Response #{i} fields={[(f[0].name, f[1]) for f in fields]}")
-            except Exception as e:
-                _log(f"⚠️ Could not dump ListFields(): {e}")
-
-            chunk = getattr(response, "text_response", "")
-            _log(f"📥 Received chunk (len={len(chunk)}): {chunk[:120]!r}")
-            if chunk:
-                got_any_text = True
-                yield chunk
-
-            if getattr(response, "is_final", False):
-                _log("🏁 is_final=True; ending")
+        req = assistant_pb2.ChatRequest(session_id=session_id, message=text, audio_data=b"")
+        complete = []
+        for resp in stub.Chat(req, timeout=timeout):
+            if resp.text_response:
+                complete.append(resp.text_response)
+            if resp.is_final:
                 break
-
-        if not got_any_msg:
-            print("⚠️ No response messages received from server.")
-        elif not got_any_text:
-            print("⚠️ Got responses but no text_response set (check proto field tags & stubs).")
-
-    except grpc.RpcError as e:
-        print(f"❌ gRPC error: {e.code().name}: {e.details()}")
-        yield f"g r p c error: {e.code().name}: {e.details()}"
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        yield f"sorry, something went wrong: {e}"
+        return "".join(complete).strip()
     finally:
-        if channel:
-            channel.close()
-
-def grpc_chat_response_collect(text: str) -> str:
-    return "".join(grpc_chat_response(text))
+        channel.close()
