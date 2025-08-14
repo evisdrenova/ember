@@ -1,8 +1,7 @@
 from __future__ import annotations
 import os, sys, struct, wave, json, time, tempfile, subprocess, signal
 from pathlib import Path
-from typing import Optional
-from audio import preload_tts, tts_stream,tts_say_full,simple_tts_say
+from audio import preload_tts,tts_say_full
 from chat import grpc_chat_response
 import pvporcupine
 from vosk import Model, KaldiRecognizer
@@ -44,7 +43,7 @@ class Ember:
 
         # Audio I/O - Use ALSA directly since plughw:3,0 works
         print("🎵 Using direct ALSA recording...")
-        self.alsa_device = "plughw:4,0"
+        self.alsa_device = "plughw:3,0"
 
         # Test ALSA recording works with a proper duration
         test_cmd = [
@@ -187,9 +186,21 @@ class Ember:
             print(f"❌ TTS/Audio error: {e}")
         finally:
             print("✅ Command handling completed\n")
+            # ALWAYS go back to wake-word mode
+            self.restart_recording()
 
     def restart_recording(self):
         """Restart the continuous audio recording process"""
+        # kill old arecord if still around
+        if hasattr(self, 'arecord_process') and self.arecord_process:
+            try:
+                if self.arecord_process.poll() is None:
+                    self.arecord_process.terminate()
+                    self.arecord_process.wait(timeout=0.5)
+            except Exception:
+                try: self.arecord_process.kill()
+                except Exception: pass
+
         arecord_cmd = [
             "arecord", "-D", self.alsa_device, "-f", "S16_LE",
             "-r", str(self.rate), "-c", "1", "-t", "raw"
