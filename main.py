@@ -263,6 +263,9 @@ from pathlib import Path
 import pvporcupine
 import webrtcvad
 import websockets
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---- Your server-side call (kept from your project) ----
 from chat import grpc_chat_response  # takes text -> returns string
@@ -336,14 +339,20 @@ class Ember:
         }
         uri = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
-        async with websockets.connect(uri, extra_headers=headers, ping_interval=20) as ws:
+        async with websockets.connect(uri, additional_headers=headers, ping_interval=20) as ws:
             # 1) Configure session to turn on input_audio transcription
             session_update = {
                 "type": "session.update",
                 "session": {
                     "input_audio_format": "pcm16",  # we're sending raw 16k Linear PCM
                     "input_audio_transcription": { "model": TRANSCRIBE_MODEL }
-                }
+                },
+                 "turn_detection": {
+    "type": "server_vad",
+    "threshold": 0.5,
+    "prefix_padding_ms": 300,
+    "silence_duration_ms": 500,
+  }
             }
             await ws.send(json.dumps(session_update))
 
