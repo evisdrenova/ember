@@ -254,444 +254,303 @@
 #     #     print(f"❌ Fatal error: {e}")
 #     #     sys.exit(1)
 
-
-
-import os
-import sys
-import json
-import struct
-import signal
-import asyncio
-import logging
-import subprocess
-import base64
+# ember_server_vad.py
+from __future__ import annotations
+import os, sys, json, struct, signal, asyncio, logging, subprocess, base64
 from pathlib import Path
 from typing import Optional
-
 import pvporcupine
-import webrtcvad
 import websockets
 import aiohttp
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
-from chat import grpc_chat_response
+from chat import grpc_chat_response  # your unary->server streaming client
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# ---------- Config & logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("ember")
 
-# Environment checks
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    logger.error("❌ Set OPENAI_API_KEY in env")
+    log.error("❌ Set OPENAI_API_KEY in env")
     sys.exit(1)
 
-# Configuration
-WAKEWORD = "computer"
-ALSA_DEVICE = os.getenv("ALSA_DEVICE", "plughw:3,0")
-SAMPLE_RATE = 16000   # Porcupine uses 16 kHz
-FRAME_LEN = 512       # Porcupine frame length (samples)
-FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)  # ~32 ms
-VAD_MODE = 2          # 0-3; 3 = most aggressive
-END_SIL_MS = 600      # stop after ~600ms of silence
+WAKEWORD     = "computer"
+ALSA_DEVICE  = os.getenv("ALSA_DEVICE", "plughw:3,0")
+SAMPLE_RATE  = 16000   # Porcupine uses 16k
+FRAME_LEN    = 512     # Porcupine frame length (samples)
+FRAME_BYTES  = FRAME_LEN * 2  # 16-bit mono
+TTS_VOICE    = os.getenv("OPENAI_TTS_VOICE", "alloy")
+TTS_FORMAT   = "wav"
 
+# ---------- TTS via OpenAI (streams to aplay) ----------
+async def speak_openai_tts(text: str, voice: str = TTS_VOICE, audio_format: str = TTS_FORMAT):
+    url = "https://api.openai.com/v1/audio/speech"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": "tts-1", "voice": voice, "input": text, "response_format": audio_format}
+    log.info(f"🔊 TTS: {text[:60]}...")
+
+    play = subprocess.Popen(["aplay", "-q", "-f", "cd"], stdin=subprocess.PIPE)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    log.error(f"TTS API error: {resp.status} - {err}")
+                    return
+                async for chunk in resp.content.iter_chunked(4096):
+                    if chunk and play.stdin:
+                        play.stdin.write(chunk)
+                        play.stdin.flush()
+        log.info("✅ TTS playback complete")
+    except Exception as e:
+        log.error(f"❌ TTS streaming error: {e}", exc_info=True)
+    finally:
+        try:
+            if play.stdin: play.stdin.close()
+            play.wait(timeout=2)
+        except Exception:
+            try: play.terminate()
+            except Exception: pass
+
+# ---------- Ember ----------
 class Ember:
     def __init__(self):
-        logger.info("Initializing Ember…")
-        
-        # Initialize Porcupine wake word detection
-        try:
-            access_key = os.getenv("PICOVOICE_ACCESS_KEY")
-            if not access_key:
-                raise ValueError("PICOVOICE_ACCESS_KEY not set")
-            
-            self.porcupine = pvporcupine.create(
-                access_key=access_key, 
-                keywords=[WAKEWORD]
-            )
-            logger.info("✅ Porcupine ready")
-        except Exception as e:
-            logger.error(f"❌ Porcupine init failed: {e}")
-            raise
+        log.info("Initializing Ember…")
+        # Wake word (Porcupine)
+        access_key = os.getenv("PICOVOICE_ACCESS_KEY")
+        if not access_key:
+            raise RuntimeError("PICOVOICE_ACCESS_KEY not set")
+        self.porcupine = pvporcupine.create(access_key=access_key, keywords=[WAKEWORD])
+        self.rate      = self.porcupine.sample_rate   # 16000
+        self.frame_len = self.porcupine.frame_length  # 512
+        log.info("✅ Porcupine ready")
 
-        self.rate = self.porcupine.sample_rate       # 16000
-        self.frame_len = self.porcupine.frame_length # 512
-        self.vad = webrtcvad.Vad(VAD_MODE)
-
-        # Test ALSA configuration
+        # ALSA sanity check
         self._test_alsa()
-        logger.info("🎙️  Say 'Computer' to start")
+        log.info("🎙️  Say 'Computer' to start")
 
     def _test_alsa(self):
-        """Quick ALSA sanity check"""
-        test_cmd = [
-            "arecord", "-D", ALSA_DEVICE, "-f", "S16_LE", 
-            "-r", str(self.rate), "-c", "1", "-t", "wav", 
-            "-d", "1", "/tmp/test.wav"
-        ]
+        cmd = ["arecord", "-D", ALSA_DEVICE, "-f", "S16_LE", "-r", str(self.rate), "-c", "1", "-t", "wav", "-d", "1", "/tmp/test.wav"]
         try:
-            subprocess.run(test_cmd, check=True, capture_output=True)
+            subprocess.run(cmd, check=True, capture_output=True)
             Path("/tmp/test.wav").unlink(missing_ok=True)
-            logger.info("🎙️ ALSA OK")
+            log.info("🎙️ ALSA OK")
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.decode() if e.stderr else str(e)
-            logger.error(f"❌ ALSA test failed: {error_msg}")
+            log.error(f"❌ ALSA test failed: {e.stderr.decode() if e.stderr else e}")
             raise
 
     def _start_arecord_raw(self):
-        """Start arecord process for continuous audio capture"""
-        cmd = [
-            "arecord", "-D", ALSA_DEVICE, "-f", "S16_LE", 
-            "-r", str(self.rate), "-c", "1", "-t", "raw"
-        ]
-        logger.debug(f"Starting arecord: {' '.join(cmd)}")
+        cmd = ["arecord", "-D", ALSA_DEVICE, "-f", "S16_LE", "-r", str(self.rate), "-c", "1", "-t", "raw"]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def _is_speech(self, pcm_bytes: bytes) -> bool:
-        """Check if audio contains speech using WebRTC VAD"""
-        # WebRTC VAD requires exactly 10, 20, or 30ms frames at 16kHz
-        # 30ms at 16kHz = 480 samples = 960 bytes
-        frame_duration_ms = 30
-        frame_size = int(self.rate * frame_duration_ms / 1000)  # 480 samples
-        frame_bytes = frame_size * 2  # 960 bytes (16-bit = 2 bytes per sample)
-        
-        # Process the audio in 30ms chunks
-        speech_detected = False
-        for i in range(0, len(pcm_bytes) - frame_bytes + 1, frame_bytes):
-            frame = pcm_bytes[i:i + frame_bytes]
-            if len(frame) == frame_bytes:
-                try:
-                    if self.vad.is_speech(frame, self.rate):
-                        speech_detected = True
-                        break
-                except Exception as e:
-                    logger.warning(f"VAD error on frame {i//frame_bytes}: {e}")
-                    # If VAD fails, try a simpler energy-based detection as fallback
-                    # Calculate RMS energy
-                    samples = struct.unpack(f"{frame_size}h", frame)
-                    energy = sum(s**2 for s in samples) / frame_size
-                    if energy > 1000000:  # Threshold for speech energy
-                        speech_detected = True
-                        break
-        
-        return speech_detected
 
     async def _stt_stream_once(self) -> str:
         """
-        Opens a WebSocket session with OpenAI Realtime API for transcription,
-        streams audio until VAD silence tail, and returns the final transcript.
+        Use OpenAI Realtime with SERVER VAD only.
+        - Configure correct input format (pcm16, 16kHz)
+        - Start a buffer, stream mic frames, stop on server VAD
+        - Only commit if we sent enough audio
         """
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
+            "OpenAI-Beta": "realtime=v1",
         }
-        # Use intent=transcription for transcription-only mode
         uri = "wss://api.openai.com/v1/realtime?intent=transcription"
-        
-        logger.info("Connecting to OpenAI Realtime API for transcription")
-        
+        MIN_COMMIT_MS = 200  # must be >= 100ms per API error
+
         async with websockets.connect(uri, additional_headers=headers, ping_interval=20) as ws:
-            # 1) Configure transcription session - wrap config in 'session' parameter
+            # 1) Configure the session (use session.update; include sample_rate_hz)
             session_update = {
-                "type": "transcription_session.update",
+                "type": "session.update",
                 "session": {
                     "input_audio_format": "pcm16",
                     "input_audio_transcription": {
                         "model": "gpt-4o-transcribe",
-                        "prompt": "",  # Optional: add context if needed
-                        "language": "en"  # Optional: specify language
+                        "language": "en",
                     },
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.5,
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                        "silence_duration_ms": 600,
                     },
-                    "input_audio_noise_reduction": {
-                        "type": "near_field"  # Good for close-mic recording
-                    }
-                }
+                    "input_audio_noise_reduction": {"type": "near_field"},
+                },
             }
-            
-            logger.debug(f"Sending session config: {json.dumps(session_update, indent=2)}")
             await ws.send(json.dumps(session_update))
-            
-            # Wait for session confirmation
+
+            # Wait for ack
             while True:
-                msg = await ws.recv()
-                evt = json.loads(msg)
-                logger.debug(f"Received event: {evt.get('type')}")
-                if evt.get("type") == "transcription_session.updated":
-                    logger.info("Session configured successfully")
+                evt = json.loads(await ws.recv())
+                t = evt.get("type")
+                if t in ("session.updated", "transcription_session.updated"):
                     break
-                elif evt.get("type") == "session.updated":
-                    # Alternative event name
-                    logger.info("Session configured successfully")
-                    break
-                elif evt.get("type") == "error":
-                    logger.error(f"Session config error: {evt}")
-                    raise RuntimeError(f"Failed to configure session: {evt}")
+                if t == "error":
+                    raise RuntimeError(f"Realtime session error: {evt}")
 
-            # 2) Start streaming audio
+            # 2) Start the audio buffer explicitly
+            await ws.send(json.dumps({"type": "input_audio_buffer.start"}))
+
+            # 3) Start mic → append loop (no local VAD)
             arec = self._start_arecord_raw()
-            logger.info("🎧 Listening… (streaming to OpenAI)")
-            silence_ms = 0
-            speaking = False
-            audio_streamed = False
+            stop_capture = asyncio.Event()
+            audio_ms_sent = 0
+            final_text = ""
 
-            try:
-                while arec.stdout:
-                    buf = arec.stdout.read(self.frame_len * 2)  # 512 samples * 2 bytes
-                    if not buf or len(buf) < self.frame_len * 2:
-                        logger.warning("Incomplete audio frame")
-                        break
-
-                    # Local VAD to determine when to stop
-                    if self._is_speech(buf):
-                        if not speaking:
-                            logger.debug("Speech detected locally")
-                        speaking = True
-                        silence_ms = 0
-                    elif speaking:
-                        silence_ms += FRAME_MS
-                        if silence_ms >= END_SIL_MS:
-                            logger.info(f"Local VAD: {silence_ms}ms of silence, stopping")
-                            break
-
-                    # Send audio chunk to OpenAI
-                    encoded = base64.b64encode(buf).decode("utf-8")
-                    audio_msg = {
-                        "type": "input_audio_buffer.append",
-                        "audio": encoded
-                    }
-                    await ws.send(json.dumps(audio_msg))
-                    audio_streamed = True
-                    
-            finally:
-                # Close mic
+            async def pump_audio():
+                loop = asyncio.get_running_loop()
                 try:
-                    arec.terminate()
-                    arec.wait(timeout=0.5)
-                except Exception as e:
-                    logger.warning(f"Error terminating arecord: {e}")
-
-            if not audio_streamed:
-                logger.warning("No audio was streamed")
-                return ""
-
-            # 3) Commit the audio buffer to trigger final transcription
-            logger.debug("Committing audio buffer")
-            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-
-            # 4) Collect transcription events
-            transcript_parts = []
-            final_transcript = ""
-            
-            # Set a timeout for receiving transcription
-            try:
-                while True:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                    evt = json.loads(msg)
-                    event_type = evt.get("type")
-                    
-                    logger.debug(f"Event: {event_type}")
-                    
-                    if event_type == "input_audio_transcription.partial":
-                        # Partial transcription update
-                        partial = evt.get("transcript", "")
-                        logger.debug(f"Partial transcript: {partial}")
-                        
-                    elif event_type == "input_audio_transcription.completed":
-                        # Final transcription
-                        final_transcript = evt.get("transcript", "")
-                        logger.info(f"Final transcript: {final_transcript}")
-                        break
-                        
-                    elif event_type == "transcription.text":
-                        # Alternative event name in some versions
-                        text = evt.get("text", "")
-                        transcript_parts.append(text)
-                        
-                    elif event_type == "transcription.final":
-                        # Final transcription event
-                        final_transcript = evt.get("text", "")
-                        logger.info(f"Final transcript: {final_transcript}")
-                        break
-                        
-                    elif event_type == "error":
-                        logger.error(f"Transcription error: {evt}")
-                        raise RuntimeError(f"Transcription error: {evt}")
-                        
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for transcription")
-                # Use whatever we collected
-                if transcript_parts:
-                    final_transcript = "".join(transcript_parts)
-
-            return final_transcript.strip()
-
-    async def once(self):
-        """Main loop: detect wake word, capture audio, transcribe, and respond"""
-        # Start wake word detection loop
-        arec = self._start_arecord_raw()
-        logger.info("👂 Wake loop started…")
-        
-        try:
-            while arec.stdout:
-                data = arec.stdout.read(self.frame_len * 2)
-                if not data or len(data) < self.frame_len * 2:
-                    logger.warning("Incomplete frame, restarting arecord")
-                    # Restart if arecord hiccups
-                    try:
+                    while not stop_capture.is_set():
+                        buf = await loop.run_in_executor(None, arec.stdout.read, self.frame_len * 2)  # 512*2=1024 bytes
+                        if not buf or len(buf) < self.frame_len * 2:
+                            break
+                        # append base64 PCM16
+                        encoded = base64.b64encode(buf).decode("utf-8")
+                        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": encoded}))
+                        audio_ms_sent += int(1000 * self.frame_len / self.rate)  # ~32ms per chunk
+                finally:
+                    with contextlib.suppress(Exception):
                         arec.terminate()
                         arec.wait(timeout=0.5)
+
+            pump_task = asyncio.create_task(pump_audio())
+
+            try:
+                # 4) Drive by server VAD & transcription events
+                while True:
+                    evt = json.loads(await ws.recv())
+                    et = evt.get("type")
+
+                    if et == "input_audio_buffer.speech_started":
+                        # optional log
+                        pass
+
+                    elif et == "input_audio_buffer.speech_stopped":
+                        # stop mic and commit if we have enough audio
+                        stop_capture.set()
+                        await pump_task
+                        if audio_ms_sent >= MIN_COMMIT_MS:
+                            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                        else:
+                            # Not enough audio; end turn without commit
+                            return ""
+
+                    elif et in ("input_audio_transcription.partial",):
+                        # optional: evt.get("transcript")
+                        pass
+
+                    elif et in ("input_audio_transcription.completed", "transcription.final"):
+                        final_text = evt.get("transcript") or evt.get("text", "") or ""
+                        # ensure mic is stopped, commit if not yet committed and we have audio
+                        stop_capture.set()
+                        await pump_task
+                        if audio_ms_sent >= MIN_COMMIT_MS:
+                            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                        break
+
+                    elif et == "error":
+                        # If it's the empty-commit error, just return ""
+                        err = evt.get("error", {}) or {}
+                        if err.get("code") == "input_audio_buffer_commit_empty":
+                            return ""
+                        raise RuntimeError(f"Realtime error: {evt}")
+
+            finally:
+                stop_capture.set()
+                with contextlib.suppress(Exception):
+                    await pump_task
+
+            return final_text.strip()
+
+    async def once(self):
+        """Wake-word loop → server-VAD transcription → gRPC reply → TTS → back to wake loop"""
+        arec = self._start_arecord_raw()
+        log.info("👂 Wake loop… say 'Computer'")
+
+        try:
+            while arec.stdout:
+                data = arec.stdout.read(FRAME_BYTES)
+                if not data or len(data) < FRAME_BYTES:
+                    log.warning("arecord hiccup, restarting…")
+                    try:
+                        arec.terminate(); arec.wait(timeout=0.5)
                     except Exception:
                         pass
                     arec = self._start_arecord_raw()
                     continue
 
-                # Porcupine wake word detection
-                pcm = struct.unpack_from("h" * self.frame_len, data)
-                keyword_index = self.porcupine.process(pcm)
-                
-                if keyword_index >= 0:
-                    logger.info("🔵 Wake word detected!")
-                    
-                    # Stop the wake detection arecord
+                pcm = struct.unpack_from("h" * FRAME_LEN, data)
+                if self.porcupine.process(pcm) >= 0:
+                    log.info("🔵 Wake word detected")
                     try:
-                        arec.terminate()
-                        arec.wait(timeout=0.5)
+                        arec.terminate(); arec.wait(timeout=0.5)
                     except Exception:
                         pass
-                    
+
+                    # Transcribe with server VAD
                     try:
-                        # Stream audio to OpenAI for transcription
                         transcript = await self._stt_stream_once()
                     except Exception as e:
-                        logger.error(f"❌ STT error: {e}", exc_info=True)
-                        # Restart wake detection
+                        log.error(f"❌ STT error: {e}", exc_info=True)
                         arec = self._start_arecord_raw()
                         continue
 
                     if not transcript:
-                        logger.info("😕 No transcript received")
-                        # Restart wake detection
+                        log.info("😕 No transcript")
                         arec = self._start_arecord_raw()
                         continue
 
-                    logger.info(f"🗣️ You said: {transcript!r}")
+                    log.info(f"🗣️ You said: {transcript!r}")
 
-                    # Call your existing gRPC pipeline
+                    # Ask your server (unary→stream, collected on client side)
                     try:
-                        reply = grpc_chat_response(transcript)  # returns plain text
+                        reply = grpc_chat_response(transcript)
                     except Exception as e:
-                        logger.error(f"❌ gRPC error: {e}", exc_info=True)
-                        # Restart wake detection
+                        log.error(f"❌ gRPC error: {e}", exc_info=True)
                         arec = self._start_arecord_raw()
                         continue
 
                     if reply and reply.strip():
-                        logger.info(f"💬 Assistant: {reply.strip()}")
+                        log.info(f"💬 Assistant: {reply.strip()}")
                         try:
-                            await speak_openai_tts(reply)  # stream TTS to speaker
+                            await speak_openai_tts(reply)
                         except Exception as e:
-                            logger.error(f"❌ TTS error: {e}", exc_info=True)
+                            log.error(f"❌ TTS error: {e}", exc_info=True)
                     else:
-                        logger.warning("⚠️ Empty reply from gRPC")
-                    
-                    # Restart wake detection for next interaction
+                        log.warning("⚠️ Empty reply from gRPC")
+
+                    # Back to wake loop
                     arec = self._start_arecord_raw()
 
         except KeyboardInterrupt:
-            logger.info("Shutting down...")
+            log.info("Shutting down…")
         finally:
             try:
-                arec.terminate()
-                arec.wait(timeout=0.5)
+                arec.terminate(); arec.wait(timeout=0.5)
             except Exception:
                 pass
 
-# ---- TTS: stream from OpenAI and play on the Pi ----
-async def speak_openai_tts(text: str, voice: str = "alloy", audio_format: str = "wav"):
-    """
-    Streams TTS audio from OpenAI and pipes it to 'aplay' for immediate playback.
-    """
-    url = "https://api.openai.com/v1/audio/speech"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": "tts-1",  # Use correct model name
-        "voice": voice,
-        "input": text,
-        "response_format": audio_format  # Correct parameter name
-    }
-
-    logger.info(f"Generating TTS for: {text[:50]}...")
-    
-    # Start aplay to consume WAV bytes from stdin
-    play = subprocess.Popen(["aplay", "-q", "-f", "cd"], stdin=subprocess.PIPE)
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"TTS API error: {resp.status} - {error_text}")
-                    return
-                    
-                resp.raise_for_status()
-                
-                # Stream audio chunks to aplay
-                async for chunk in resp.content.iter_chunked(4096):
-                    if chunk and play.stdin:
-                        play.stdin.write(chunk)
-                        play.stdin.flush()
-                        
-                logger.info("TTS playback complete")
-                
-    except Exception as e:
-        logger.error(f"TTS streaming error: {e}", exc_info=True)
-    finally:
-        if play.stdin:
-            try:
-                play.stdin.close()
-            except Exception:
-                pass
-        try:
-            play.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            logger.warning("aplay timeout, terminating")
-            try:
-                play.terminate()
-            except Exception:
-                pass
+# ---------- main ----------
+import contextlib
 
 async def main():
-    """Main entry point"""
     ember = Ember()
-    
-    # Run continuously
     while True:
         try:
             await ember.once()
         except KeyboardInterrupt:
-            logger.info("Received interrupt signal")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            # Continue running despite errors
+            log.error(f"Loop error: {e}", exc_info=True)
             await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    # Handle SIGINT gracefully
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Goodbye!")
+        log.info("Goodbye!")
         sys.exit(0)
